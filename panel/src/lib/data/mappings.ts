@@ -45,4 +45,5 @@ export const LanguagesMapping: Record<Languages, string> = {
 export const rolesMapping: Record<Roles, string> = {
     [Roles.ROOT]: 'Root',
     [Roles.ADMIN]: 'Admin',
+    [Roles.CLIENT]: 'Client',
 };

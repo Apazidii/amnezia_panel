@@ -138,6 +138,8 @@ export const getRoleColor = (role: Roles) => {
             return 'bg-blue-100 text-blue-800';
         case 'ROOT':
             return 'bg-red-100 text-red-800';
+        case 'CLIENT':
+            return 'bg-green-100 text-green-800';
     }
 };
 

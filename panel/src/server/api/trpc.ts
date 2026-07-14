@@ -16,7 +16,6 @@ import { db } from '@/server/db';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../auth/options';
 import { rolesHierarchy, type Role } from '@/lib/utils';
-import type { Roles } from 'prisma/generated/enums';
 
 /**
  * 1. CONTEXT
@@ -169,7 +168,7 @@ const roleGuardMiddleware = (requiredRole: Role) => {
     });
 };
 
-export const protectedProcedureWithRole = (requiredRole: Roles) =>
+export const protectedProcedureWithRole = (requiredRole: Role) =>
     t.procedure.use(roleGuardMiddleware(requiredRole));
 
 const clientGuardMiddleware = t.middleware(async ({ ctx, next }) => {

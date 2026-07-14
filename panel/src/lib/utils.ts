@@ -154,5 +154,5 @@ export function telegramToastError(error: any) {
     }
 }
 
-export const rolesHierarchy = ['ADMIN', 'ROOT'] as const;
+export const rolesHierarchy = ['CLIENT', 'ADMIN', 'ROOT'] as const;
 export type Role = (typeof rolesHierarchy)[number];

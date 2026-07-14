@@ -24,8 +24,7 @@ export function SidebarPermissions() {
                 }
 
                 return (
-                    rolesHierarchy.indexOf(userRole as (typeof rolesHierarchy)[number]) >=
-                    rolesHierarchy.indexOf(item.role as (typeof rolesHierarchy)[number])
+                    rolesHierarchy.indexOf(userRole) >= rolesHierarchy.indexOf(item.role)
                 );
             });
 

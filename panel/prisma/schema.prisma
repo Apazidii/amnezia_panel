@@ -1,0 +1,110 @@
+generator client {
+    provider = "prisma-client"
+    output   = "./generated"
+}
+
+datasource db {
+    provider = "postgresql"
+    // url      = env("DATABASE_URL")
+}
+
+model Servers {
+    id        Int       @id @default(autoincrement())
+    createdAt DateTime  @default(now())
+    name      String
+    ip        String
+    port      Int
+    apiKey    Json
+    Configs   Configs[]
+    Clients   Clients[]
+}
+
+model Admins {
+    id           String   @id @default(cuid())
+    createdAt    DateTime @default(now())
+    login        String   @unique
+    password     String
+    role         Roles
+    isFirstLogin Boolean  @default(true)
+    Logs         Logs[]
+}
+
+model Clients {
+    id           Int       @id @default(autoincrement())
+    createdAt    DateTime  @default(now())
+    name         String
+    language     Languages
+    telegramId   String?
+    status       Boolean   @default(true)
+    login        String?   @unique
+    password     String?
+    isFirstLogin Boolean   @default(true)
+    serverId     Int?
+    Servers      Servers?  @relation(fields: [serverId], references: [id])
+    Configs      Configs[]
+}
+
+model Configs {
+    id         String    @id
+    createdAt  DateTime  @default(now())
+    clientName String
+    vpnKey     Json
+    expiresAt  String?
+    status     Boolean   @default(true)
+    protocol   Protocols
+    clientId   Int?
+    serverId   Int
+    Clients    Clients?  @relation(fields: [clientId], references: [id])
+    Servers    Servers   @relation(fields: [serverId], references: [id])
+}
+
+model Logs {
+    id        Int        @id @default(autoincrement())
+    createdAt DateTime   @default(now())
+    logType   LogTypes
+    levelType LevelTypes
+    message   String
+    adminId   String?
+    Admins    Admins?    @relation(fields: [adminId], references: [id])
+}
+
+model PaymentSettings {
+    id                  Int      @id @default(autoincrement())
+    createdAt           DateTime @default(now())
+    updatedAt           DateTime @updatedAt
+    defaultPrice        Float
+    additionalPrice     Float
+    defaultConfigsCount Int
+    paymentLink         String
+    adminTelegramIds    Json? // String[]
+}
+
+enum Roles {
+    ROOT
+    ADMIN
+    CLIENT
+}
+
+enum Protocols {
+    AMNEZIAWG
+    AMNEZIAWG2
+    XRAY
+}
+
+enum LevelTypes {
+    INFO
+    WARNING
+    ERROR
+}
+
+enum LogTypes {
+    ADMIN
+    TELEGRAM
+    SERVER
+    CLIENT
+}
+
+enum Languages {
+    RUSSIAN
+    ENGLISH
+}

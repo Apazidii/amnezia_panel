@@ -1,0 +1,769 @@
+import { z } from 'zod';
+import bcrypt from 'bcryptjs';
+
+import { createTRPCRouter, protectedProcedureWithRole } from '@/server/api/trpc';
+import type { ProtocolsFilter } from '@/server/enums';
+import type { Languages, Prisma } from 'prisma/generated/client';
+import {
+    createClientSchema,
+    sendNotificationSchema,
+    updateClientSchema,
+} from '@/lib/schemas/clients';
+import { amneziaApiService } from '@/server/services/amnezia-api';
+import { apiProtocolsMapping, protocolsApiMapping } from '@/lib/data/mappings';
+import { encryptionService } from '@/server/services/encryption';
+import type { IPeer } from '@/server/interfaces/amnezia-api';
+import { logsService } from '@/server/services/logs';
+import { TRPCError } from '@trpc/server';
+import { sendConfigsToTelegram } from '@/server/services/telegram/telegram-messages';
+import { telegramService } from '@/server/services/telegram/telegram';
+import { updateExpiresAtSchema } from '@/lib/schemas/configs';
+
+async function assertLoginAvailable(
+    db: {
+        admins: {
+            findUnique: (args: {
+                where: { login: string };
+                select: { login: true };
+            }) => Promise<{ login: string } | null>;
+        };
+        clients: {
+            findUnique: (args: {
+                where: { login: string };
+                select: { id: true };
+            }) => Promise<{ id: number } | null>;
+        };
+    },
+    login: string,
+    excludeClientId?: number
+) {
+    const existingAdmin = await db.admins.findUnique({
+        where: { login },
+        select: { login: true },
+    });
+
+    if (existingAdmin) {
+        throw new TRPCError({ code: 'CONFLICT', message: 'Login is already taken' });
+    }
+
+    const existingClient = await db.clients.findUnique({
+        where: { login },
+        select: { id: true },
+    });
+
+    if (existingClient && existingClient.id !== excludeClientId) {
+        throw new TRPCError({ code: 'CONFLICT', message: 'Login is already taken' });
+    }
+}
+
+export const clientsRouter = createTRPCRouter({
+    getClients: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ serverId: z.string().optional() }))
+        .query(async ({ input, ctx }) => {
+            const { serverId } = input;
+
+            return await ctx.db.clients.findMany({
+                where: {
+                    ...(serverId && {
+                        Configs: {
+                            some: {
+                                serverId: Number(serverId),
+                            },
+                        },
+                    }),
+                },
+                select: {
+                    id: true,
+                    name: true,
+                },
+            });
+        }),
+
+    getClientsWithConfigs: protectedProcedureWithRole('ADMIN')
+        .input(
+            z.object({
+                serverId: z.string().optional(),
+                search: z.string().optional(),
+                protocolFilter: z.string() as z.ZodType<ProtocolsFilter>,
+            })
+        )
+        .query(async ({ ctx, input }) => {
+            const { search, protocolFilter } = input;
+            const serverId = Number(input.serverId);
+            if (!serverId) return;
+
+            const apiConfigs = await amneziaApiService.getConfigs(serverId);
+
+            const apiDevicesMap = new Map<string, IPeer>();
+            const apiDevices: Array<{
+                id: string;
+                clientName: string;
+                device: IPeer;
+            }> = [];
+
+            for (const user of apiConfigs.items) {
+                for (const device of user.peers) {
+                    apiDevicesMap.set(device.id, device);
+                    apiDevices.push({
+                        id: device.id,
+                        clientName: user.username,
+                        device: device,
+                    });
+                }
+            }
+
+            const baseWhereConditions: Prisma.ConfigsWhereInput = {
+                serverId: serverId,
+            };
+
+            const [configsFromDb, clients] = await Promise.all([
+                ctx.db.configs.findMany({
+                    where: baseWhereConditions,
+                    select: {
+                        id: true,
+                        createdAt: true,
+                        clientName: true,
+                        expiresAt: true,
+                        protocol: true,
+                        clientId: true,
+                        serverId: true,
+                        status: true,
+                    },
+                    orderBy: {
+                        expiresAt: 'asc',
+                    },
+                }),
+                ctx.db.clients.findMany({
+                    where: {
+                        Configs: {
+                            some: { serverId },
+                        },
+                    },
+                    include: {
+                        Configs: { select: { expiresAt: true } },
+                        Servers: { select: { name: true } },
+                    },
+                }),
+            ]);
+
+            const mergedConfigs = configsFromDb.map((config) => {
+                const apiDevice = apiDevicesMap.get(config.id);
+
+                if (apiDevice) {
+                    return {
+                        ...config,
+                        status: apiDevice.status === 'active' ? true : false,
+                        online: apiDevice.online,
+                        lastHandshake: String(apiDevice.lastHandshake),
+                        traffic: apiDevice.traffic,
+                        allowedIps: apiDevice.allowedIps,
+                        endpoint: apiDevice.endpoint,
+                        expiresAt: String(apiDevice.expiresAt) || config.expiresAt,
+                        protocol: apiProtocolsMapping[apiDevice.protocol],
+                        source: 'db',
+                    };
+                }
+
+                return {
+                    ...config,
+                    status: false,
+                    online: false,
+                    lastHandshake: null,
+                    traffic: { received: 0, sent: 0 },
+                    allowedIps: [],
+                    endpoint: null,
+                    expiresAt: config.expiresAt,
+                    source: 'db',
+                };
+            });
+
+            const dbConfigIds = new Set(configsFromDb.map((c) => c.id));
+
+            for (const apiDevice of apiDevices) {
+                if (!dbConfigIds.has(apiDevice.id)) {
+                    mergedConfigs.push({
+                        id: apiDevice.id,
+                        createdAt: new Date(),
+                        status: apiDevice.device.status === 'active' ? true : false,
+                        clientName: apiDevice.clientName,
+                        expiresAt: apiDevice.device.expiresAt
+                            ? String(apiDevice.device.expiresAt)
+                            : null,
+                        protocol: apiProtocolsMapping[apiDevice.device.protocol],
+                        clientId: null,
+                        serverId,
+                        online: apiDevice.device.online,
+                        lastHandshake: String(apiDevice.device.lastHandshake),
+                        traffic: apiDevice.device.traffic,
+                        allowedIps: apiDevice.device.allowedIps,
+                        endpoint: apiDevice.device.endpoint,
+                        source: 'api',
+                    });
+                }
+            }
+
+            let filteredConfigs = mergedConfigs;
+
+            if (search) {
+                const searchLower = search.toLowerCase();
+                filteredConfigs = filteredConfigs.filter((config) =>
+                    config.clientName.toLowerCase().includes(searchLower)
+                );
+            }
+
+            if (protocolFilter && protocolFilter !== 'All') {
+                filteredConfigs = filteredConfigs.filter(
+                    (config) => config.protocol === protocolFilter
+                );
+            }
+
+            const configsByClientId = new Map<string, typeof filteredConfigs>();
+            for (const config of filteredConfigs) {
+                const clientId = String(config.clientId);
+
+                if (clientId && clientId !== 'null') {
+                    if (!configsByClientId.has(clientId)) configsByClientId.set(clientId, []);
+
+                    configsByClientId.get(clientId)!.push(config);
+                }
+            }
+
+            const sortedClients = (clients || []).sort((a, b) => {
+                const getMinExpiry = (client: typeof a) => {
+                    const configs = configsByClientId.get(String(client.id)) || [];
+
+                    const timestamps = configs
+                        .map((c) => {
+                            if (!c.expiresAt) return null;
+                            const ts = new Date(c.expiresAt).getTime();
+                            return isNaN(ts) ? null : ts;
+                        })
+                        .filter((t): t is number => t !== null);
+
+                    return timestamps.length ? Math.min(...timestamps) : Infinity;
+                };
+
+                return getMinExpiry(a) - getMinExpiry(b);
+            });
+
+            const clientsWithConfigs = sortedClients.map((client) => {
+                const clientConfigs = configsByClientId.get(String(client.id)) || [];
+                return {
+                    id: client.id,
+                    createdAt: client.createdAt,
+                    name: client.name,
+                    language: client.language,
+                    status: client.status,
+                    telegramId: client.telegramId,
+                    login: client.login,
+                    serverId: client.serverId,
+                    serverName: client.Servers?.name ?? null,
+                    configs: clientConfigs,
+                    configsCount: clientConfigs.length,
+                };
+            });
+
+            const orphanConfigs = filteredConfigs.filter((config) => !config.clientId);
+
+            return {
+                clients: clientsWithConfigs,
+                orphanConfigs,
+                totalClients: clients.length,
+            };
+        }),
+
+    createClient: protectedProcedureWithRole('ADMIN')
+        .input(createClientSchema)
+        .mutation(async ({ ctx, input }) => {
+            const { name, language, telegramId, configs, serverId, login, password } = input;
+
+            const server = await ctx.db.servers.findUnique({
+                where: { id: Number(serverId) },
+                select: { id: true },
+            });
+
+            if (!server) {
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Server not found' });
+            }
+
+            await assertLoginAvailable(ctx.db, login);
+
+            for (const config of configs) {
+                if (Number(config.serverId) !== Number(serverId)) {
+                    throw new TRPCError({
+                        code: 'BAD_REQUEST',
+                        message: 'All configs must use the client server',
+                    });
+                }
+            }
+
+            const hashedPassword = await bcrypt.hash(password, 12);
+
+            const createdClient = await ctx.db.clients.create({
+                data: {
+                    name,
+                    language: language as Languages,
+                    telegramId,
+                    serverId: Number(serverId),
+                    login,
+                    password: hashedPassword,
+                    isFirstLogin: true,
+                },
+            });
+
+            for (const config of configs) {
+                const createdConfig = await amneziaApiService.createConfig(
+                    Number(config.serverId),
+                    config.clientName,
+                    protocolsApiMapping[config.protocol],
+                    Number(config.expiresAt)
+                );
+
+                const encryptedVpnKey = encryptionService.encrypt(createdConfig.client.config);
+
+                await ctx.db.configs.create({
+                    data: {
+                        id: createdConfig.client.id,
+                        clientName: config.clientName,
+                        vpnKey: encryptedVpnKey,
+                        protocol: config.protocol,
+                        expiresAt: config.expiresAt,
+                        clientId: createdClient.id,
+                        serverId: Number(config.serverId),
+                    },
+                });
+
+                await logsService.createLog(
+                    'CLIENT',
+                    'INFO',
+                    `Config <${config.clientName}> created`,
+                    ctx.session.user.id
+                );
+            }
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Client <${createdClient.name}> created`,
+                ctx.session.user.id
+            );
+        }),
+
+    updateClient: protectedProcedureWithRole('ADMIN')
+        .input(updateClientSchema)
+        .mutation(async ({ ctx, input }) => {
+            const { id, name, telegramId, language, serverId, login, password } = input;
+
+            const existingClient = await ctx.db.clients.findUnique({
+                where: { id },
+                select: {
+                    id: true,
+                    serverId: true,
+                    login: true,
+                    _count: { select: { Configs: true } },
+                },
+            });
+
+            if (!existingClient) {
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Client not found' });
+            }
+
+            const newServerId = Number(serverId);
+
+            if (
+                existingClient.serverId != null &&
+                existingClient.serverId !== newServerId &&
+                existingClient._count.Configs > 0
+            ) {
+                throw new TRPCError({
+                    code: 'BAD_REQUEST',
+                    message: 'Cannot change server while client has configs',
+                });
+            }
+
+            const server = await ctx.db.servers.findUnique({
+                where: { id: newServerId },
+                select: { id: true },
+            });
+
+            if (!server) {
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Server not found' });
+            }
+
+            const nextLogin = login?.trim() || undefined;
+            if (nextLogin) {
+                await assertLoginAvailable(ctx.db, nextLogin, id);
+            }
+
+            if (nextLogin && !existingClient.login && !password) {
+                throw new TRPCError({
+                    code: 'BAD_REQUEST',
+                    message: 'Password is required when enabling cabinet login',
+                });
+            }
+
+            const data: Prisma.ClientsUpdateInput = {
+                name,
+                telegramId,
+                language,
+                Servers: { connect: { id: newServerId } },
+            };
+
+            if (nextLogin) {
+                data.login = nextLogin;
+            }
+
+            if (password) {
+                data.password = await bcrypt.hash(password, 12);
+                data.isFirstLogin = true;
+            }
+
+            const updatedClient = await ctx.db.clients.update({
+                where: { id },
+                data,
+                select: { name: true },
+            });
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Client <${updatedClient.name}> updated`,
+                ctx.session.user.id
+            );
+        }),
+
+    deleteClient: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ id: z.number() }))
+        .mutation(async ({ ctx, input }) => {
+            const { id } = input;
+
+            const foundConfigs = await ctx.db.configs.findMany({
+                where: { clientId: id },
+                select: { id: true, serverId: true, protocol: true },
+            });
+
+            for (const config of foundConfigs) {
+                await amneziaApiService.deleteConfig(
+                    Number(config.serverId),
+                    config.id,
+                    protocolsApiMapping[config.protocol]
+                );
+            }
+
+            await ctx.db.configs.deleteMany({
+                where: { clientId: id },
+            });
+
+            const deletedClient = await ctx.db.clients.delete({
+                where: { id },
+                select: { name: true },
+            });
+
+            await logsService.createLog(
+                'CLIENT',
+                'WARNING',
+                `Client <${deletedClient.name}> deleted`,
+                ctx.session.user.id
+            );
+        }),
+
+    sendKeysForClient: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ id: z.number() }))
+        .mutation(async ({ ctx, input }) => {
+            const { id } = input;
+
+            const foundClient = await ctx.db.clients.findUnique({
+                where: { id },
+                select: {
+                    name: true,
+                    telegramId: true,
+                    language: true,
+                    Configs: {
+                        select: {
+                            vpnKey: true,
+                            clientName: true,
+                            protocol: true,
+                            expiresAt: true,
+                        },
+                    },
+                },
+            });
+
+            if (!foundClient || !foundClient.telegramId)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Client not found' });
+
+            if (foundClient.Configs.length === 0) {
+                throw new TRPCError({
+                    code: 'BAD_REQUEST',
+                    message: 'No VPN configurations found for this client',
+                });
+            }
+
+            await sendConfigsToTelegram(
+                foundClient.name,
+                foundClient.telegramId,
+                foundClient.language,
+                foundClient.Configs
+            );
+
+            await logsService.createLog(
+                'TELEGRAM',
+                'INFO',
+                `VPN keys sent for client <${foundClient.name}>`,
+                ctx.session.user.id
+            );
+        }),
+
+    sendAllKeys: protectedProcedureWithRole('ADMIN').mutation(async ({ ctx }) => {
+        const foundClients = await ctx.db.clients.findMany({
+            select: {
+                name: true,
+                telegramId: true,
+                language: true,
+                Configs: {
+                    select: {
+                        vpnKey: true,
+                        clientName: true,
+                        protocol: true,
+                        expiresAt: true,
+                    },
+                },
+            },
+        });
+
+        if (!foundClients) throw new TRPCError({ code: 'NOT_FOUND', message: 'Clients not found' });
+
+        for (const foundClient of foundClients) {
+            if (foundClient.Configs.length === 0 || !foundClient.telegramId) {
+                await logsService.createLog(
+                    'TELEGRAM',
+                    'WARNING',
+                    `VPN keys not sent for client <${foundClient.name}>`,
+                    ctx.session.user.id
+                );
+                continue;
+            }
+
+            await sendConfigsToTelegram(
+                foundClient.name,
+                foundClient.telegramId,
+                foundClient.language,
+                foundClient.Configs
+            );
+        }
+
+        await logsService.createLog(
+            'TELEGRAM',
+            'INFO',
+            `VPN keys sent for clients`,
+            ctx.session.user.id
+        );
+    }),
+
+    sendDownloadLinks: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ id: z.number() }))
+        .mutation(async ({ ctx, input }) => {
+            const { id } = input;
+
+            const foundClient = await ctx.db.clients.findUnique({
+                where: { id },
+                select: { telegramId: true, name: true, language: true },
+            });
+            if (!foundClient?.telegramId)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Client not found' });
+
+            const message =
+                foundClient.language === 'ENGLISH'
+                    ? `For using <b>${process.env.NEXT_PUBLIC_VPN_NAME}</b> you need to download the open-source AmneziaVPN app.
+
+<b>💻 Computers & Laptops</b>
+• <a href="https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.15.4/AmneziaVPN_4.8.15.4_x64.exe">Windows</a> 
+• <a href="https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.15.4/AmneziaVPN_4.8.15.4_macos.pkg">macOS</a> 
+• <a href="https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.15.4/AmneziaVPN_4.8.15.4_linux_x64.tar">Linux</a>
+• <a href="https://docs.amnezia.org/documentation/installing-app-on-linux">Linux docs</a>
+
+<b>📱 Smartphones & Tablets</b>
+• <a href="https://play.google.com/store/apps/details?id=org.amnezia.vpn">Android</a>
+• <a href="https://apps.apple.com/us/app/amneziavpn/id1600529900">iPhone / iPad</a>`
+                    : `Для использования <b>${process.env.NEXT_PUBLIC_VPN_NAME}</b> вам нужно скачать open-source приложение AmneziaVPN.
+
+<b>💻 Компьютеры и ноутбуки</b>
+• <a href="https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.15.4/AmneziaVPN_4.8.15.4_x64.exe">Windows</a> 
+• <a href="https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.15.4/AmneziaVPN_4.8.15.4_macos.pkg">macOS</a> 
+• <a href="https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.15.4/AmneziaVPN_4.8.15.4_linux_x64.tar">Linux</a>
+• <a href="https://docs.amnezia.org/documentation/installing-app-on-linux">Документация для Linux</a>
+
+<b>📱 Смартфоны и планшеты</b>
+• <a href="https://play.google.com/store/apps/details?id=org.amnezia.vpn">Android</a>
+• <a href="https://apps.apple.com/us/app/amneziavpn/id1600529900">iPhone / iPad</a>`;
+
+            await telegramService.sendMessage(
+                {
+                    chatId: foundClient.telegramId,
+                    text: message,
+                    parseMode: 'HTML',
+                },
+                foundClient.name
+            );
+
+            await logsService.createLog(
+                'TELEGRAM',
+                'INFO',
+                `Links sent for client <${foundClient.name}>`,
+                ctx.session.user.id
+            );
+        }),
+
+    sendNotification: protectedProcedureWithRole('ADMIN')
+        .input(sendNotificationSchema)
+        .mutation(async ({ ctx, input }) => {
+            const { clientId, message } = input;
+
+            if (clientId === 'All Russian' || clientId === 'All English') {
+                const language = clientId === 'All Russian' ? 'RUSSIAN' : 'ENGLISH';
+
+                const clients = await ctx.db.clients.findMany({
+                    where: { language },
+                    select: { telegramId: true, name: true },
+                });
+
+                const validClients = clients.filter((client) => client.telegramId);
+
+                const BATCH_SIZE = 10;
+
+                for (let i = 0; i < validClients.length; i += BATCH_SIZE) {
+                    const batch = validClients.slice(i, i + BATCH_SIZE);
+
+                    await Promise.allSettled(
+                        batch.map((client) =>
+                            telegramService.sendMessage(
+                                {
+                                    chatId: client.telegramId!,
+                                    text: message,
+                                    parseMode: 'HTML',
+                                },
+                                client.name
+                            )
+                        )
+                    );
+
+                    if (i + BATCH_SIZE < validClients.length) {
+                        await new Promise((resolve) => setTimeout(resolve, 100));
+                    }
+                }
+
+                await logsService.createLog(
+                    'TELEGRAM',
+                    'INFO',
+                    `Mass notification sent to ${validClients.length} ${language.toLowerCase()} clients`,
+                    ctx.session.user.id
+                );
+            } else {
+                const foundClient = await ctx.db.clients.findUnique({
+                    where: { id: Number(clientId) },
+                    select: { telegramId: true, name: true },
+                });
+
+                if (!foundClient?.telegramId) {
+                    throw new TRPCError({
+                        code: 'NOT_FOUND',
+                        message: 'Client not found or has no Telegram ID',
+                    });
+                }
+
+                await telegramService.sendMessage(
+                    {
+                        chatId: foundClient.telegramId,
+                        text: message,
+                        parseMode: 'HTML',
+                    },
+                    foundClient.name
+                );
+
+                await logsService.createLog(
+                    'TELEGRAM',
+                    'INFO',
+                    `Notification sent to client <${foundClient.name}>`,
+                    ctx.session.user.id
+                );
+            }
+        }),
+
+    updateExpiresAt: protectedProcedureWithRole('ADMIN')
+        .input(updateExpiresAtSchema)
+        .mutation(async ({ ctx, input }) => {
+            const { id, expiresAt } = input;
+
+            const foundClient = await ctx.db.clients.findUnique({
+                where: { id: Number(id) },
+                select: {
+                    name: true,
+                    Configs: { select: { id: true, serverId: true, protocol: true } },
+                },
+            });
+            if (!foundClient)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Client not found' });
+
+            for (const config of foundClient.Configs)
+                await amneziaApiService.updateConfig(
+                    config.serverId,
+                    config.id,
+                    protocolsApiMapping[config.protocol],
+                    expiresAt
+                );
+
+            await ctx.db.configs.updateMany({
+                where: { clientId: Number(id) },
+                data: { expiresAt },
+            });
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Dates of config were changed for client <${foundClient.name}>`,
+                ctx.session.user.id
+            );
+        }),
+
+    updateStatus: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ clientId: z.number().min(1), status: z.string().min(1) }))
+        .mutation(async ({ ctx, input }) => {
+            const { clientId, status } = input;
+
+            const foundClient = await ctx.db.clients.findUnique({
+                where: { id: clientId },
+                select: {
+                    name: true,
+                    Configs: { select: { id: true, serverId: true, protocol: true } },
+                },
+            });
+            if (!foundClient)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Client not found' });
+
+            for (const config of foundClient.Configs)
+                await amneziaApiService.updateConfig(
+                    config.serverId,
+                    config.id,
+                    protocolsApiMapping[config.protocol],
+                    undefined,
+                    status
+                );
+
+            await ctx.db.clients.update({
+                where: { id: clientId },
+                data: { status: status === 'active' ? true : false },
+            });
+
+            await ctx.db.configs.updateMany({
+                where: { clientId },
+                data: { status: status === 'active' ? true : false },
+            });
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Statuses of config were changed for client <${foundClient.name}>`,
+                ctx.session.user.id
+            );
+        }),
+});

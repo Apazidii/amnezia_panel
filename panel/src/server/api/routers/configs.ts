@@ -1,0 +1,278 @@
+import { z } from 'zod';
+
+import { createTRPCRouter, protectedProcedureWithRole } from '@/server/api/trpc';
+import {
+    createConfigSchema,
+    updateClientConfigSchema,
+    updateExpiresAtSchema,
+} from '@/lib/schemas/configs';
+import { amneziaApiService } from '@/server/services/amnezia-api';
+import { protocolsApiMapping, protocolsMapping } from '@/lib/data/mappings';
+import { encryptionService } from '@/server/services/encryption';
+import { TRPCError } from '@trpc/server';
+import { logsService } from '@/server/services/logs';
+import { Protocols } from 'prisma/generated/enums';
+import { format } from 'date-fns';
+import { telegramService } from '@/server/services/telegram/telegram';
+
+export const configsRouter = createTRPCRouter({
+    createConfig: protectedProcedureWithRole('ADMIN')
+        .input(createConfigSchema)
+        .mutation(async ({ ctx, input }) => {
+            const { clientId, serverId, clientName, expiresAt, protocol } = input;
+
+            if (clientId) {
+                const client = await ctx.db.clients.findUnique({
+                    where: { id: Number(clientId) },
+                    select: { serverId: true },
+                });
+
+                if (client?.serverId != null && client.serverId !== Number(serverId)) {
+                    throw new TRPCError({
+                        code: 'BAD_REQUEST',
+                        message: 'Config server must match the client server',
+                    });
+                }
+            }
+
+            const createdConfig = await amneziaApiService.createConfig(
+                Number(serverId),
+                clientName,
+                protocolsApiMapping[protocol],
+                Number(expiresAt)
+            );
+
+            const encryptedVpnKey = encryptionService.encrypt(createdConfig.client.config);
+
+            await ctx.db.configs.create({
+                data: {
+                    id: createdConfig.client.id,
+                    serverId: Number(serverId),
+                    clientId: Number(clientId) || null,
+                    clientName,
+                    expiresAt,
+                    protocol,
+                    vpnKey: encryptedVpnKey,
+                },
+            });
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Config <${clientName}> created`,
+                ctx.session.user.id
+            );
+        }),
+
+    updateClientConfig: protectedProcedureWithRole('ADMIN')
+        .input(updateClientConfigSchema)
+        .mutation(async ({ ctx, input }) => {
+            const { id, clientId } = input;
+
+            const updatedConfig = await ctx.db.configs.update({
+                where: { id },
+                data: { clientId: Number(clientId) },
+                select: { clientName: true },
+            });
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Config <${updatedConfig.clientName}> updated`,
+                ctx.session.user.id
+            );
+        }),
+
+    deleteConfig: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ serverId: z.number(), id: z.string(), protocol: z.enum(Protocols) }))
+        .mutation(async ({ ctx, input }) => {
+            const { serverId, id, protocol } = input;
+
+            const foundConfig = await ctx.db.configs.findUnique({
+                where: { id },
+                select: { serverId: true, protocol: true },
+            });
+
+            await amneziaApiService.deleteConfig(serverId, id, protocolsApiMapping[protocol]);
+
+            let deletedConfig: {
+                clientName: string;
+            } | null = null;
+
+            if (foundConfig) {
+                deletedConfig = await ctx.db.configs.delete({
+                    where: { id },
+                    select: { clientName: true },
+                });
+            }
+
+            await logsService.createLog(
+                'CLIENT',
+                'WARNING',
+                `Config <${deletedConfig?.clientName || 'that does not exist in database'}> deleted`,
+                ctx.session.user.id
+            );
+        }),
+
+    getVpnKey: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ id: z.string() }))
+        .query(async ({ ctx, input }) => {
+            const { id } = input;
+
+            const foundConfig = await ctx.db.configs.findUnique({
+                where: { id },
+                select: { vpnKey: true },
+            });
+
+            return await encryptionService.decryptField(foundConfig?.vpnKey);
+        }),
+
+    sendVpnKey: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ id: z.string() }))
+        .mutation(async ({ ctx, input }) => {
+            const { id } = input;
+
+            const foundConfig = await ctx.db.configs.findUnique({
+                where: { id },
+                select: {
+                    vpnKey: true,
+                    clientName: true,
+                    expiresAt: true,
+                    protocol: true,
+                    Clients: { select: { name: true, telegramId: true, language: true } },
+                },
+            });
+            if (!foundConfig)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Config not found' });
+
+            if (!foundConfig.Clients?.telegramId)
+                throw new TRPCError({
+                    code: 'NOT_FOUND',
+                    message: 'Client does not have a Telegram Chat ID',
+                });
+
+            const decryptedVpnKey = encryptionService.decryptField(foundConfig.vpnKey);
+            const expiryDate = foundConfig.expiresAt
+                ? foundConfig.Clients.language === 'ENGLISH'
+                    ? format(new Date(Number(foundConfig.expiresAt) * 1000), 'MM/dd/yyyy')
+                    : format(new Date(Number(foundConfig.expiresAt) * 1000), 'dd.MM.yyyy')
+                : 'Not set';
+
+            const message =
+                foundConfig.Clients.language === 'ENGLISH'
+                    ? `
+🔐 New VPN configuration for <b>${foundConfig.clientName.startsWith(foundConfig.Clients.name) ? foundConfig.clientName.split('-')[1] : foundConfig.clientName}</b> from Ne4VPN
+Protocol: <b>${protocolsMapping[foundConfig.protocol] || 'Not specified'}</b>
+Expiration date: <b>${expiryDate}</b>
+<code>${decryptedVpnKey}</code>`
+                    : `
+🔐 Новый VPN ключ для <b>${foundConfig.clientName.startsWith(foundConfig.Clients.name) ? foundConfig.clientName.split('-')[1] : foundConfig.clientName}</b> от Ne4VPN
+Протокол: <b>${protocolsMapping[foundConfig.protocol] || 'Не указан'}</b>
+Дата истечения: <b>${expiryDate}</b>
+<code>${decryptedVpnKey}</code>`;
+
+            await telegramService.sendMessage(
+                {
+                    chatId: foundConfig.Clients.telegramId,
+                    text: message,
+                    parseMode: 'HTML',
+                },
+                foundConfig.Clients.name
+            );
+
+            await logsService.createLog(
+                'TELEGRAM',
+                'INFO',
+                `VPN key of <${foundConfig?.clientName}> sent`,
+                ctx.session.user.id
+            );
+        }),
+
+    updateExpiresAt: protectedProcedureWithRole('ADMIN')
+        .input(updateExpiresAtSchema)
+        .mutation(async ({ ctx, input }) => {
+            const { id, expiresAt } = input;
+
+            const foundConfig = await ctx.db.configs.findUnique({
+                where: { id },
+                select: { serverId: true, clientName: true, protocol: true },
+            });
+            if (!foundConfig)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Config not found' });
+
+            await amneziaApiService.updateConfig(
+                foundConfig.serverId,
+                id,
+                protocolsApiMapping[foundConfig.protocol],
+                expiresAt
+            );
+
+            if (foundConfig) {
+                await ctx.db.configs.update({
+                    where: { id },
+                    data: { expiresAt },
+                });
+            }
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Config <${foundConfig.clientName}> date was changed`,
+                ctx.session.user.id
+            );
+        }),
+
+    updateStatus: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ id: z.string().min(1), status: z.string().min(1) }))
+        .mutation(async ({ ctx, input }) => {
+            const { id, status } = input;
+
+            const foundConfig = await ctx.db.configs.findUnique({
+                where: { id },
+                select: { serverId: true, clientName: true, protocol: true },
+            });
+            if (!foundConfig)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Config not found' });
+
+            await amneziaApiService.updateConfig(
+                foundConfig.serverId,
+                id,
+                protocolsApiMapping[foundConfig.protocol],
+                undefined,
+                status
+            );
+
+            if (foundConfig) {
+                await ctx.db.configs.update({
+                    where: { id },
+                    data: { status: status === 'active' ? true : false },
+                });
+            }
+
+            await logsService.createLog(
+                'CLIENT',
+                'INFO',
+                `Config <${foundConfig.clientName}> status was changed`,
+                ctx.session.user.id
+            );
+        }),
+
+    generateQrCode: protectedProcedureWithRole('ADMIN')
+        .input(z.object({ id: z.string().min(1) }))
+        .query(async ({ ctx, input }) => {
+            const { id } = input;
+
+            const foundConfig = await ctx.db.configs.findUnique({
+                where: { id },
+                select: { serverId: true, vpnKey: true },
+            });
+            if (!foundConfig)
+                throw new TRPCError({ code: 'NOT_FOUND', message: 'Config not found' });
+
+            const decryptedVpnKey = encryptionService.decryptField(foundConfig.vpnKey);
+            if (!decryptedVpnKey)
+                throw new TRPCError({ code: 'BAD_REQUEST', message: 'VPN Config not found' });
+
+            return await amneziaApiService.generateQrCode(foundConfig.serverId, decryptedVpnKey);
+        }),
+});
